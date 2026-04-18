@@ -1,4 +1,4 @@
-.. Copyright 2010-2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+.. Copyright 2010-2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
    This work is licensed under a Creative Commons Attribution-NonCommercial-ShareAlike 4.0
    International License (the "License"). You may not use this file except in compliance with the
@@ -7,125 +7,141 @@
    This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
    either express or implied. See the License for the specific language governing permissions and
    limitations under the License.
-   
+
 .. _aws-boto3-ec2-instance-lifecycle:
 
-#####################################
-Understanding EC2 Instance Lifecycle
-#####################################
+###########################
+EC2 Instance Lifecycle Guide
+###########################
 
-When writing automation scripts, responding to infrastructure events, or troubleshooting
-behavior, it is critical to correctly handle Amazon EC2 instance state transitions. Because
-AWS is a distributed system, API calls that change an instance's state (such as starting,
-stopping, or terminating an instance) are asynchronous. 
+Understanding the lifecycle of an Amazon EC2 instance is critical for building robust automation. This guide explains how instance state transitions are surfaced through Boto3, highlights non-obvious behaviors, and provides best practices for handling lifecycle changes in your scripts.
 
-This guide explains how these lifecycle transitions surface in Boto3, non-obvious behaviors 
-in practice, and how to properly write reliable automation for your EC2 instances.
+Instance States
+===============
 
-The Instance State Object 
-=========================
+An EC2 instance transitions through several states from the moment it is launched until it is terminated.
 
-Whether you use the Boto3 EC2 client or resource, you will often inspect an instance's state.
-The state is typically represented as a dictionary containing a ``Code`` and a ``Name``:
+* **pending**: The instance is being prepared. It is not yet available for login.
+* **running**: The instance is fully functional and billing is active.
+* **stopping**: The instance is transitioning from running to stopped.
+* **stopped**: The instance is shut down but still exists. You are not billed for instance usage, but you are billed for EBS volumes.
+* **shutting-down**: The instance is being prepared for termination.
+* **terminated**: The instance has been permanently deleted.
 
-* **0 (pending)**: The instance is preparing to enter the ``running`` state.
-* **16 (running)**: The instance is running and ready for use.
-* **32 (shutting-down)**: The instance is preparing to be terminated.
-* **48 (terminated)**: The instance has been permanently deleted.
-* **64 (stopping)**: The instance is preparing to be stopped.
-* **80 (stopped)**: The instance is shut down and not incurring compute charges.
+Accessing State in Boto3
+========================
 
-Common Pitfalls with Instance State
-===================================
+You can check the current state of an instance using either the high-level Resource interface or the low-level Client interface.
 
-1. Eventual Consistency and Stale Data (Resource Model)
+Using Resources
+---------------
 
-If you are using the EC2 Boto3 Resource model, it is crucial to remember that resource 
-objects cache their attributes. Calling a state transition method (e.g., ``instance.stop()``) 
-does *not* automatically update the ``instance.state`` attribute on your Python object.
+The Resource interface provides a human-readable state name and a numerical code.
 
 .. code-block:: python
 
     import boto3
-    
+
     ec2 = boto3.resource('ec2')
     instance = ec2.Instance('i-1234567890abcdef0')
-    
-    print(instance.state['Name'])  # e.g., 'running'
-    instance.stop()
-    print(instance.state['Name'])  # Still says 'running'!
-    
-    # You MUST reload the instance to get the updated status
-    instance.reload()
-    print(instance.state['Name'])  # Now says 'stopping'
 
-2. Asynchronous Transitions vs. Final States
+    print(f"State Name: {instance.state['Name']}")
+    print(f"State Code: {instance.state['Code']}")
 
-When you request an instance to terminate, the EC2 API returns an immediate response indicating 
-the instance has entered the ``shutting-down`` state. It does not wait for the instance to hit 
-``terminated``. Scripts the rely on an instance being fully terminated before continuing 
-(like deleting a VPC) will fail if they do not wait.
+Using Clients
+-------------
 
-Using Waiters for Reliability
-=============================
-
-The most robust way to handle asynchronous lifecycle events is by using Waiters. Boto3 Waiters
-automatically poll the EC2 API and pause your script until an instance has reached a desired 
-final state. 
-
-Here are the standard EC2 instance waiters:
-
-* ``InstanceExists``
-* ``InstanceRunning``
-* ``InstanceStopped``
-* ``InstanceTerminated``
-
-Practical Example: Starting an Instance Securely
-------------------------------------------------
+The Client interface returns the state within the ``describe_instances`` response.
 
 .. code-block:: python
 
     import boto3
 
-    ec2_client = boto3.client('ec2')
-    
-    # 1. Request the instance to start
-    instance_id = 'i-1234567890abcdef0'
-    ec2_client.start_instances(InstanceIds=[instance_id])
-    
-    # 2. Get the waiter
-    waiter = ec2_client.get_waiter('instance_running')
-    
-    # 3. Wait for the instance to be fully running
-    print(f"Waiting for instance {instance_id} to be running...")
-    waiter.wait(InstanceIds=[instance_id])
+    client = boto3.client('ec2')
+    response = client.describe_instances(InstanceIds=['i-1234567890abcdef0'])
+    state = response['Reservations'][0]['Instances'][0]['State']
+
+    print(f"State Name: {state['Name']}")
+
+.. note::
+   State codes are useful for programmatic comparisons (e.g., 16 is ``running``), while names are better for logging.
+
+Waiters: Automating State Transitions
+=====================================
+
+A common mistake in automation is attempting to use an instance before it has fully transitioned (e.g., trying to SSH into a ``pending`` instance). Boto3 Waiters poll the instance state for you.
+
+.. code-block:: python
+
+    # Using Resource Waiters
+    instance.start()
+    instance.wait_until_running()
     print("Instance is now running!")
 
-Practical Example: Terminating an Instance
-------------------------------------------
+    # Using Client Waiters
+    client.start_instances(InstanceIds=['i-1234567890abcdef0'])
+    waiter = client.get_waiter('instance_running')
+    waiter.wait(InstanceIds=['i-1234567890abcdef0'])
 
-When deleting infrastructure, relying on waiters ensures subsequent deletion API calls 
-do not fail due to dependency violations:
+Waiters are the preferred alternative to manual ``time.sleep()`` loops because they are optimized for the specific service behavior.
+
+Non-Obvious Behaviors and Pitfalls
+==================================
+
+When writing automation, keep these often-overlooked behaviors in mind:
+
+IP Address Volatility
+---------------------
+When an instance is stopped, it releases its public IPv4 address. When it is restarted, it receives a new public IPv4 address.
+* **Automation Impact**: If your script stores the IP address at launch, it will be incorrect after a stop/start cycle. Use Elastic IPs if you need a persistent address.
+* **Boto3 Detail**: The ``PublicIpAddress`` attribute may be missing entirely from the ``describe_instances`` response if the instance is in a ``stopped`` state.
+
+Attribute Latency
+-----------------
+Properties like ``PublicIpAddress`` or ``PublicDnsName`` are often not assigned until the instance reaches the ``running`` state.
+* **Gotcha**: If you call ``instance.reload()`` immediately after ``run_instances()``, these attributes might still be empty. Always wait for the ``running`` state before fetching network metadata.
+
+Instance Store vs. EBS
+----------------------
+* **Stopped State**: Only EBS-backed instances can be stopped. Instance store-backed instances can only be terminated or rebooted.
+* **Data Loss**: Data on instance store volumes is lost when an instance is stopped (for EBS-backed instances with instance store volumes) or terminated.
+
+Termination Protection
+----------------------
+If termination protection is enabled, Boto3 calls to ``terminate_instances()`` will fail with a ``ClientError``. Your automation should handle this or explicitly disable protection first.
+
+Practical Example: Robust Instance Start
+========================================
+
+This example demonstrates how to safely start an instance and retrieve its public IP once it's available.
 
 .. code-block:: python
 
     import boto3
+    from botocore.exceptions import WaiterError
 
-    ec2_resource = boto3.resource('ec2')
-    instance = ec2_resource.Instance('i-1234567890abcdef0')
-    
-    # Terminate the instance
-    response = instance.terminate()
-    print(f"Current state: {response[0]['CurrentState']['Name']}") # 'shutting-down'
-    
-    # Wait until it is fully terminated
-    instance.wait_until_terminated()
-    
-    print("Instance terminated. Safe to remove security groups or VPCs.")
-    
-Best Practices Summary
+    def start_and_get_ip(instance_id):
+        ec2 = boto3.resource('ec2')
+        instance = ec2.Instance(instance_id)
+
+        print(f"Starting instance {instance_id}...")
+        instance.start()
+
+        try:
+            # Wait up to 10 minutes (default) for the instance to be running
+            instance.wait_until_running()
+            
+            # Reload attributes to ensure we have the latest metadata
+            instance.reload()
+            
+            print(f"Instance is running at: {instance.public_ip_address}")
+            return instance.public_ip_address
+        except WaiterError as e:
+            print(f"Instance failed to start: {e}")
+            return None
+
+Common Troubleshooting
 ======================
 
-* **Never assume immediate state changes:** API calls like ``start_instances()`` and ``stop_instances()`` only initiate the transition.
-* **Always use Waiters:** When writing automation, rely on Waiters rather than writing custom loops with ``time.sleep()``.
-* **Reload Resource attributes:** If you inspect object properties (``instance.state``) across time, call ``instance.reload()`` to ensure your data is fresh.
+* **Instance stuck in "stopping"**: This can happen if the OS is taking a long time to shut down. Waiters will eventually timeout. Your script should catch ``WaiterError`` and decide whether to force-stop or alert.
+* **State Mismatch**: If you query an instance state immediately after an action, you might get the *old* state due to eventual consistency. Use waiters to ensure you are reasoning about the actual current state.
